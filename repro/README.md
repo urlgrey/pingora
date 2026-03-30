@@ -1,10 +1,10 @@
-# Finding 1: Uninitialized Memory Exposure in Body Buffer
+# Finding 1: Unsafe `set_len()` in Body Buffer — Latent Memory Safety Issue
 
 ## Severity
-High
+Medium (downgraded from High after testing)
 
 ## Bug Class
-Memory safety — use of uninitialized memory
+Memory safety — CWE-908: Use of Uninitialized Resource (latent, not currently exploitable)
 
 ## Affected Code
 - File: `pingora-core/src/protocols/http/v1/body.rs`
@@ -29,7 +29,9 @@ Note the commented-out safe alternative (`resize` zero-fills) directly above the
 When the chunked body parser encounters a chunk-size line split across TCP segments, the `partial_chunk_head` + `copy_within` reconstruction logic can leave gaps of uninitialized memory in the returned body data. This can leak sensitive heap data (other requests' headers, bodies, auth tokens) to clients.
 
 ## Client-Triggerable?
-**YES** — A client controls TCP segmentation via `TCP_NODELAY` + small `send()` calls with delays. The client can reliably force the chunk-size line to split across reads.
+**NO (currently)** — After thorough code review and 200-iteration stress testing, the current chunked body parser correctly tracks the initialized region via `existing_buf_end` and never returns a `BufRef` into uninitialized memory. The `partial_chunk_head` + `copy_within` path maintains correct bounds.
+
+The unsafe `set_len()` is a **latent** risk: any future parser change that accidentally indexes past `existing_buf_end` would silently leak heap data instead of panicking. The safe alternative is commented out on the line above.
 
 ## Reproduction Steps
 
@@ -105,11 +107,17 @@ The PoC sends requests with known body content (`Hello` + `B`×10 + `C`×16 = 31
 - **Expected:** `prepare_buf()` should use `body_buf.resize(self.body_buf_size, 0)` (the commented-out line) to zero-fill the buffer, ensuring no uninitialized memory can leak.
 - **Actual:** `unsafe { body_buf.set_len(self.body_buf_size) }` extends the buffer without initialization. When partial chunk reads trigger `copy_within`, gaps of uninitialized heap memory can be included in the body data returned to the application.
 
-## Impact
+## Testing Results
 
-- **Information disclosure:** Heap data from other requests (headers, bodies, cookies, auth tokens) can leak to clients
-- **Cross-request data leak:** On a shared proxy, one user's data can appear in another user's response
-- **Reliable trigger:** The attacker controls TCP segmentation, making the timing-dependent path reliably reachable
+**200-iteration stress test with varied TCP timing: 0 anomalies detected.**
+
+The current parser is safe despite the unsafe primitive. The `existing_buf_end` tracking in `do_read_chunked_body` (line ~380-415) correctly bounds all `BufRef` returns.
+
+## Impact (latent)
+
+- **Future regression risk:** Any parser modification that indexes past `existing_buf_end` leaks heap data silently (no panic, no bounds check)
+- **Code quality:** The safe version (`resize`) is commented out one line above — trivial fix with negligible performance cost
+- **Not currently exploitable:** Stress testing confirms the parser tracks bounds correctly
 
 ## Fix
 
