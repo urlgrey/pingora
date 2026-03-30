@@ -4,77 +4,73 @@
 Low
 
 ## Bug Class
-Connection pooling — insufficient hash space for uniqueness
+Connection pooling / Cross-origin data leak
 
 ## Affected Code
 - File: `pingora-pool/src/connection.rs`
-- Lines: 27-28 (`GroupKey` type definition and hashing)
+- Lines: 27-28
 
 ## Description
-Pingora's connection pool uses a `u64` `GroupKey` (a hash of the upstream address) to group and reuse connections. The 64-bit hash space is insufficient for guaranteed collision-free mapping of distinct upstream addresses in large-scale deployments.
 
-With the birthday attack principle, approximately 2^32 (~4 billion) distinct upstream addresses have a ~50% chance of a hash collision. In a multi-tenant CDN scenario where requests route to millions of distinct backends, the probability of collisions becomes non-negligible.
+The pingora connection pool uses a `u64` value as its `GroupKey` type:
 
-When two different upstream addresses hash to the same `GroupKey`:
-- A request intended for `backend-a.example.com` may be sent over a connection originally established to `backend-b.example.com`
-- The client's request and auth tokens are forwarded to the wrong upstream
-- Sensitive data (auth headers, request bodies, session tokens) intended for one backend leak to another backend
+```rust
+type GroupKey = u64;
+```
 
-This is particularly dangerous in multi-tenant environments where backends belong to different organizations, or in zero-trust architectures where each backend is considered untrusted.
+Connections are stored and retrieved by this key. The `get()` method returns **any** idle connection matching the key:
+
+```rust
+pub fn get(&self, key: &GroupKey) -> Option<S> {
+    // ...
+    if let Some((id, connection)) = pool_node.get_any() {
+```
+
+If two different upstream backends (e.g., `backend-a.example.com:443` and `backend-b.example.com:443`) produce the same `GroupKey` via the hash function used upstream, a request intended for backend A could be sent over a pooled connection to backend B. The response from the wrong backend would be served to the client.
+
+The 64-bit key space makes deliberate collisions difficult, but birthday-attack collisions become feasible at scale. With ~2^32 distinct upstream destinations (plausible for a multi-tenant CDN), there's a ~50% probability of at least one collision pair. The actual risk depends on how the `GroupKey` is computed from the upstream address and TLS configuration — the pool crate itself is agnostic to this.
+
+In a multi-tenant CDN scenario where different customers share the same proxy infrastructure, a collision could cause one customer's response to be served to another customer's users — a cross-origin data leak.
 
 ## Reproduction Steps
 
-### Rust Test (Collision Demonstration)
-1. Build and run the test:
-   ```bash
-   cd repro/rust_test
-   cargo test -- --nocapture
-   ```
-2. The test searches for two distinct upstream addresses that produce the same u64 hash
-3. If a collision is found, it demonstrates the vulnerability
-4. If direct collision is rare, the test provides probabilistic analysis
+### Birthday Attack Probability Analysis
 
-### Python Script (Birthday Attack Analysis)
-1. Run the probability calculator:
+1. Run the included Python script to compute collision probabilities:
    ```bash
-   python3 repro/repro_pool_collision.py --mode analyze
+   python3 repro/birthday_analysis.py
    ```
-   This shows the probability of collisions for different numbers of upstreams
 
-2. Run the collision finder:
-   ```bash
-   python3 repro/repro_pool_collision.py --mode search --upstreams 10000
-   ```
-   This generates random upstream addresses and looks for hash collisions
+2. The script computes:
+   - P(collision) for N upstreams in a 64-bit key space
+   - The number of upstreams needed for 1%, 10%, 50% collision probability
 
-3. Run the attack simulator:
+### Rust Test: Demonstrating Pool Behavior on Collision
+
+1. The included Rust test shows that if two different "backends" happen to produce the same `GroupKey`, the pool returns the wrong connection:
+
    ```bash
-   python3 repro/repro_pool_collision.py --mode attack
+   cd pingora-pool
+   cargo test --test pool_collision_test
    ```
-   Demonstrates the impact of a collision on request routing
+
+   Or copy `repro/pool_collision_test.rs` into `pingora-pool/tests/`.
 
 ## Expected vs Actual Behavior
-- **Expected:** The pool should use a hash function with sufficient space (128-bit or larger), or maintain a secondary lookup table to ensure collision-free mapping of distinct upstream addresses.
-- **Actual:** A 64-bit hash space is used, making collisions probable in large deployments. Requests can be routed to the wrong upstream server due to hash collisions.
+
+- **Expected:** Each upstream backend has a unique pool key. Connections are never reused across different backends.
+- **Actual:** The `u64` key space permits hash collisions. If two backends produce the same key, their connections are interchangeable in the pool, causing cross-origin response delivery.
 
 ## Impact
-- **Cross-origin connection reuse:** Requests intended for one upstream are sent over connections to a different upstream
-- **Authentication leakage:** Auth tokens from one client leak to a different backend
-- **Data exposure:** Request bodies, session cookies, and sensitive headers leak between unrelated backends
-- **Multi-tenant isolation breach:** In SaaS/CDN scenarios, requests from tenant A reach backends of tenant B
 
-## Probabilistic Analysis
+- **Multi-tenant CDN:** Customer A's response served to Customer B's users
+- **Internal microservices:** Response from service A delivered as if it came from service B
+- **TLS context mismatch:** If TLS session info is not part of the key, a plaintext connection could be reused where TLS is expected (or vice versa)
 
-For a 64-bit hash space with N distinct upstreams:
-- **N = 1 million:** ~0.1% collision probability
-- **N = 10 million:** ~1% collision probability  
-- **N = 100 million:** ~10% collision probability
-- **N = 1 billion:** ~40% collision probability
-- **N = 10 billion:** ~99%+ collision probability
-
-By the birthday paradox, we expect a collision with ~2^32 (4 billion) distinct upstreams.
+The practical exploitability depends on the hash function quality and whether an attacker can control or enumerate upstream destinations to find collisions.
 
 ## References
-- [CWE-441: Unintended Proxy/Intermediary](https://cwe.mitre.org/data/definitions/441.html)
-- [Birthday attack](https://en.wikipedia.org/wiki/Birthday_attack)
-- [Hash collision examples (SipHash, xxHash)](https://github.com/tkaitchuck/xxhash-rust/issues)
+
+- [Birthday attack](https://en.wikipedia.org/wiki/Birthday_attack) — collision probability in finite key spaces
+- `pingora-pool/src/connection.rs` — pool implementation
+- `pingora-core/src/connectors/` — upstream connector that generates GroupKey values
